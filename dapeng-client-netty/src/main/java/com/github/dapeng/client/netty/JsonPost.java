@@ -1,23 +1,29 @@
 package com.github.dapeng.client.netty;
 
-import com.github.dapeng.core.InvocationContext;
-import com.github.dapeng.core.SoaConnectionPool;
-import com.github.dapeng.core.SoaConnectionPoolFactory;
-import com.github.dapeng.core.SoaException;
+import com.github.dapeng.core.*;
+import com.github.dapeng.core.helper.DapengUtil;
+import com.github.dapeng.core.helper.SoaSystemEnvProperties;
 import com.github.dapeng.core.metadata.Method;
 import com.github.dapeng.core.metadata.Service;
 import com.github.dapeng.json.JsonSerializer;
+import com.github.dapeng.json.OptimizedMetadata;
 import com.github.dapeng.util.DumpUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.ServiceLoader;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 
 
 /**
- * Created by tangliu on 2016/4/13.
+ * @author tangliu
+ * @date 2016/4/13
  */
 public class JsonPost {
 
@@ -25,64 +31,71 @@ public class JsonPost {
 
     private boolean doNotThrowError = false;
 
-    private SoaConnectionPool pool;
+    private final static SoaConnectionPoolFactory factory = ServiceLoader.load(SoaConnectionPoolFactory.class, JsonPost.class.getClassLoader()).iterator().next();
 
-    public JsonPost(String serviceName, String version) {
-        ServiceLoader<SoaConnectionPoolFactory> factories = ServiceLoader.load(SoaConnectionPoolFactory.class);
-        for (SoaConnectionPoolFactory factory : factories) {
-            this.pool = factory.getPool();
-            break;
-        }
-        this.pool.registerClientInfo(serviceName, version);
+
+    private SoaConnectionPool pool;
+    private final SoaConnectionPool.ClientInfo clientInfo;
+    private final String methodName;
+
+    public JsonPost(final String serviceName, final String version, final String methodName) {
+        this.methodName = methodName;
+        this.pool = factory.getPool();
+        this.clientInfo = this.pool.registerClientInfo(serviceName, version);
     }
 
-    public JsonPost(String serviceName, String version, boolean doNotThrowError) {
-        this(serviceName, version);
+    public JsonPost(final String serviceName, final String version, final String methodName, boolean doNotThrowError) {
+        this(serviceName, version, methodName);
         this.doNotThrowError = doNotThrowError;
     }
 
     /**
      * 调用远程服务
      *
-     * @param invocationContext
      * @param jsonParameter
-     * @param service
+     * @param optimizedService
      * @return
      * @throws Exception
      */
-    public String callServiceMethod(InvocationContext invocationContext,
-                                    String jsonParameter, Service service) throws Exception {
+    public String callServiceMethod(final String jsonParameter,
+                                    final OptimizedMetadata.OptimizedService optimizedService) throws Exception {
+        Method method = optimizedService.getMethodMap().get(methodName);
 
-        if (null == jsonParameter || "".equals(jsonParameter.trim())) {
-            jsonParameter = "{}" ;
+        if (method == null) {
+            return String.format("{\"responseCode\":\"%s\", \"responseMsg\":\"%s\", \"success\":\"{}\", \"status\":0}",
+                    SoaCode.NoMatchedMethod,
+                    "method:" + methodName + " for service:" + clientInfo.serviceName + " not found");
         }
 
-        List<Method> targetMethods = service.getMethods().stream().filter(element ->
-                element.name.equals(invocationContext.getMethodName()))
-                .collect(Collectors.toList());
+        try {
+            String sessionTid = InvocationContextImpl.Factory.currentInstance().sessionTid().map(DapengUtil::longToHexStr).orElse("0");
+            MDC.put(SoaSystemEnvProperties.KEY_LOGGER_SESSION_TID, sessionTid);
 
-        if (targetMethods.isEmpty()) {
-            return "method:" + invocationContext.getMethodName() + " for service:"
-                    + invocationContext.getServiceName() + " not found" ;
+            OptimizedMetadata.OptimizedStruct req = optimizedService.getOptimizedStructs().get(method.request.namespace + "." + method.request.name);
+            OptimizedMetadata.OptimizedStruct resp = optimizedService.getOptimizedStructs().get(method.response.namespace + "." + method.response.name);
+
+            JsonSerializer jsonEncoder = new JsonSerializer(optimizedService, method, clientInfo.version, req);
+            JsonSerializer jsonDecoder = new JsonSerializer(optimizedService, method, clientInfo.version, resp);
+
+            final long beginTime = System.currentTimeMillis();
+
+            Service origService = optimizedService.getService();
+            LOGGER.info("soa-request: service:[" + origService.namespace + "." + origService.name
+                    + ":" + origService.meta.version + "], method:" + methodName + ", param:"
+                    + jsonParameter);
+
+            String jsonResponse = post(clientInfo.serviceName, clientInfo.version,
+                    methodName, jsonParameter, jsonEncoder, jsonDecoder);
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("soa-response: " + jsonResponse + " cost:" + (System.currentTimeMillis() - beginTime) + "ms");
+            } else {
+                LOGGER.info("soa-response: " + DumpUtil.formatToString(jsonResponse) + " cost:" + (System.currentTimeMillis() - beginTime) + "ms");
+            }
+
+            return jsonResponse;
+        } finally {
+            MDC.remove(SoaSystemEnvProperties.KEY_LOGGER_SESSION_TID);
         }
-
-        Method method = targetMethods.get(0);
-
-
-        JsonSerializer jsonEncoder = new JsonSerializer(service, method, method.request, jsonParameter);
-        JsonSerializer jsonDecoder = new JsonSerializer(service, method, method.response);
-
-        final long beginTime = System.currentTimeMillis();
-
-        String jsonResponse = post(invocationContext.getServiceName(), invocationContext.getVersionName(),
-                method.name, jsonParameter, jsonEncoder, jsonDecoder);
-        if (LOGGER.isDebugEnabled()) {
-            LOGGER.debug("soa-response: " + jsonResponse + " cost:" + (System.currentTimeMillis() - beginTime) + "ms");
-        } else {
-            LOGGER.info("soa-response: " + DumpUtil.formatToString(jsonResponse) + (System.currentTimeMillis() - beginTime) + "ms");
-        }
-
-        return jsonResponse;
     }
 
 
@@ -93,24 +106,28 @@ public class JsonPost {
      */
     private String post(String serviceName, String version, String method, String requestJson, JsonSerializer jsonEncoder, JsonSerializer jsonDecoder) throws Exception {
 
-        String jsonResponse = "{}" ;
-
+        String jsonResponse;
+        String sessionTid = MDC.get(SoaSystemEnvProperties.KEY_LOGGER_SESSION_TID);
         try {
             String result = this.pool.send(serviceName, version, method, requestJson, jsonEncoder, jsonDecoder);
-
-            jsonResponse = result.equals("{}")?"{\"status\":1}":result.substring(0,result.lastIndexOf('}')) + ",\"status\":1}";
-
+            jsonResponse = result.equals("{}") ? "{\"status\":1}" : result.substring(0, result.lastIndexOf('}')) + ",\"status\":1}";
+            //MDC will be remove by client filter
+            MDC.put(SoaSystemEnvProperties.KEY_LOGGER_SESSION_TID, sessionTid);
         } catch (SoaException e) {
-
-            LOGGER.error(e.getMsg(), e);
+            MDC.put(SoaSystemEnvProperties.KEY_LOGGER_SESSION_TID, sessionTid);
+            if (DapengUtil.isDapengCoreException(e)) {
+                LOGGER.error(e.getMsg(), e);
+            } else {
+                LOGGER.error(e.getMsg());
+            }
             if (doNotThrowError) {
                 jsonResponse = String.format("{\"responseCode\":\"%s\", \"responseMsg\":\"%s\", \"success\":\"%s\", \"status\":0}", e.getCode(), e.getMsg(), "{}");
             } else {
                 throw e;
             }
 
-        }  catch (Exception e) {
-
+        } catch (Exception e) {
+            MDC.put(SoaSystemEnvProperties.KEY_LOGGER_SESSION_TID, sessionTid);
             LOGGER.error(e.getMessage(), e);
             if (doNotThrowError) {
                 jsonResponse = String.format("{\"responseCode\":\"%s\", \"responseMsg\":\"%s\", \"success\":\"%s\", \"status\":0}", "9999", "系统繁忙，请稍后再试[9999]！", "{}");
@@ -120,6 +137,89 @@ public class JsonPost {
 
         }
 
+        return jsonResponse;
+    }
+
+
+    /**
+     * 异步调用远程服务
+     *
+     * @param jsonParameter    json请求
+     * @param optimizedService 服务元数据信息
+     * @return
+     * @throws Exception
+     */
+    public Future<String> callServiceMethodAsync(final String jsonParameter,
+                                                 final OptimizedMetadata.OptimizedService optimizedService) throws Exception {
+        Method method = optimizedService.getMethodMap().get(methodName);
+
+        if (method == null) {
+
+            String resp = String.format("{\"responseCode\":\"%s\", \"responseMsg\":\"%s\", \"success\":\"{}\", \"status\":0}",
+                    SoaCode.NoMatchedMethod,
+                    "method:" + methodName + " for service:" + clientInfo.serviceName + " not found");
+            return CompletableFuture.completedFuture(resp);
+        }
+
+        try {
+            String sessionTid = InvocationContextImpl.Factory.currentInstance().sessionTid().map(DapengUtil::longToHexStr).orElse("0");
+            MDC.put(SoaSystemEnvProperties.KEY_LOGGER_SESSION_TID, sessionTid);
+
+            OptimizedMetadata.OptimizedStruct req = optimizedService.getOptimizedStructs().get(method.request.namespace + "." + method.request.name);
+            OptimizedMetadata.OptimizedStruct resp = optimizedService.getOptimizedStructs().get(method.response.namespace + "." + method.response.name);
+
+            JsonSerializer jsonEncoder = new JsonSerializer(optimizedService, method, clientInfo.version, req);
+            JsonSerializer jsonDecoder = new JsonSerializer(optimizedService, method, clientInfo.version, resp);
+
+            Service origService = optimizedService.getService();
+
+            LOGGER.info("soa-request: service:[" + origService.namespace + "." + origService.name
+                    + ":" + origService.meta.version + "], method:" + methodName + ", param:"
+                    + jsonParameter);
+
+            Future<String> jsonResponse = postAsync(clientInfo.serviceName, clientInfo.version,
+                    methodName, jsonParameter, jsonEncoder, jsonDecoder);
+            //MDC will be remove by client filter
+            MDC.put(SoaSystemEnvProperties.KEY_LOGGER_SESSION_TID, sessionTid);
+
+            return jsonResponse;
+        } finally {
+            MDC.remove(SoaSystemEnvProperties.KEY_LOGGER_SESSION_TID);
+        }
+
+
+    }
+
+    /**
+     * 构建客户端，发送和接收异步请求
+     *
+     * @return
+     */
+    private Future<String> postAsync(String serviceName, String version, String method, String requestJson, JsonSerializer jsonEncoder, JsonSerializer jsonDecoder) throws Exception {
+        Future<String> jsonResponse;
+        try {
+            jsonResponse = this.pool.sendAsync(serviceName, version, method, requestJson, jsonEncoder, jsonDecoder);
+        } catch (SoaException e) {
+            if (DapengUtil.isDapengCoreException(e)) {
+                LOGGER.error(e.getMsg(), e);
+            } else {
+                LOGGER.error(e.getMsg());
+            }
+            if (doNotThrowError) {
+                jsonResponse = CompletableFuture.completedFuture(String.format("{\"responseCode\":\"%s\", \"responseMsg\":\"%s\", \"success\":\"%s\", \"status\":0}", e.getCode(), e.getMsg(), "{}"));
+            } else {
+                throw e;
+            }
+
+        } catch (Exception e) {
+
+            LOGGER.error(e.getMessage(), e);
+            if (doNotThrowError) {
+                jsonResponse = CompletableFuture.completedFuture(String.format("{\"responseCode\":\"%s\", \"responseMsg\":\"%s\", \"success\":\"%s\", \"status\":0}", "9999", "系统繁忙，请稍后再试[9999]！", "{}"));
+            } else {
+                throw e;
+            }
+        }
         return jsonResponse;
     }
 }

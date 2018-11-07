@@ -3,8 +3,11 @@ package com.github.dapeng.impl.plugins;
 import com.github.dapeng.api.Container;
 import com.github.dapeng.api.ContainerFactory;
 import com.github.dapeng.api.Plugin;
+import com.github.dapeng.api.lifecycle.LifecycleProcessorFactory;
 import com.github.dapeng.core.*;
 import com.github.dapeng.core.definition.SoaServiceDefinition;
+import com.github.dapeng.core.helper.SoaSystemEnvProperties;
+import com.github.dapeng.core.lifecycle.LifeCycleAware;
 import com.github.dapeng.impl.container.DapengApplication;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,7 +33,7 @@ public class SpringAppLoader implements Plugin {
 
     @Override
     public void start() {
-        LOGGER.warn("Plugin::SpringAppLoader start.");
+        LOGGER.warn("Plugin::" + getClass().getSimpleName() + "::start");
         String configPath = "META-INF/spring/services.xml";
 
         ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
@@ -52,26 +55,34 @@ public class SpringAppLoader implements Plugin {
 
                 Map<String, SoaServiceDefinition<?>> processorMap = (Map<String, SoaServiceDefinition<?>>)
                         method.invoke(springCtx, appClassLoader.loadClass(SoaServiceDefinition.class.getName()));
+
+                //获取所有实现了lifecycle的bean
+                LifecycleProcessorFactory.getLifecycleProcessor().addLifecycles(((Map<String, LifeCycleAware>)
+                        method.invoke(springCtx, appClassLoader.loadClass(LifeCycleAware.class.getName()))).values());
+
+
                 //TODO: 需要构造Application对象
                 Map<String, ServiceInfo> appInfos = toServiceInfos(processorMap);
-                Application application = new DapengApplication(appInfos.values().stream().collect(Collectors.toList()),
-                        appClassLoader);
-
-                Map<ProcessorKey, SoaServiceDefinition<?>> serviceDefinitionMap = toSoaServiceDefinitionMap(appInfos, processorMap);
-                container.registerAppProcessors(serviceDefinitionMap);
-
-                // IApplication app = new ...
-                if (!application.getServiceInfos().isEmpty()) {
-                    container.registerApplication(application);
-                    container.registerAppMap(toApplicationMap(serviceDefinitionMap, application));
-                }
-
-                LOGGER.info(" ------------ SpringClassLoader: " + ContainerFactory.getContainer().getApplications());
+                Application application = new DapengApplication(new ArrayList<>(appInfos.values()), appClassLoader);
 
                 //Start spring context
                 LOGGER.info(" start to boot app");
                 Method startMethod = appCtxClass.getMethod("start");
                 startMethod.invoke(springCtx);
+
+                // IApplication app = new ...
+                if (!application.getServiceInfos().isEmpty()) {
+                    // fixme only registerApplication
+                    Map<ProcessorKey, SoaServiceDefinition<?>> serviceDefinitionMap = toSoaServiceDefinitionMap(appInfos, processorMap);
+                    container.registerAppProcessors(serviceDefinitionMap);
+
+                    container.registerAppMap(toApplicationMap(serviceDefinitionMap, application));
+                    //fire a zk event
+                    container.registerApplication(application);
+                }
+
+                LOGGER.info(" ------------ SpringClassLoader: " + ContainerFactory.getContainer().getApplications());
+
 
             } catch (Exception e) {
                 LOGGER.error(e.getMessage(), e);
@@ -91,22 +102,19 @@ public class SpringAppLoader implements Plugin {
 
     @Override
     public void stop() {
-        LOGGER.warn("Plugin:SpringAppLoader stop.");
-        LOGGER.warn("Gracefully shutdown not implemented yet");
-        // TODO stop or close??
-//        springCtxs.forEach(springCtx -> {
-//            LOGGER.info(" stop unload app");
-//            try {
-//                Method stopMethod = springCtx.getClass().getMethod("stop");
-//                stopMethod.invoke(springCtx);
-//            } catch (NoSuchMethodException e) {
-//                LOGGER.error(e.getMessage(), e);
-//            } catch (IllegalAccessException e) {
-//                LOGGER.error(e.getMessage(), e);
-//            } catch (InvocationTargetException e) {
-//                LOGGER.error(e.getMessage(), e);
-//            }
-//        });
+        LOGGER.warn("Plugin::" + getClass().getSimpleName() + "::stop");
+        springCtxs.forEach(context -> {
+            try {
+                LOGGER.info(" start to close SpringApplication.....");
+                Method method = context.getClass().getMethod("close");
+                method.invoke(context);
+            } catch (NoSuchMethodException e) {
+                LOGGER.info(" failed to get context close method.....");
+            } catch (IllegalAccessException | InvocationTargetException e) {
+                LOGGER.info(e.getMessage());
+            }
+        });
+        LOGGER.warn("Plugin:SpringAppLoader stoped..");
     }
 
     private Map<String, ServiceInfo> toServiceInfos(Map<String, SoaServiceDefinition<?>> processorMap)
@@ -127,13 +135,41 @@ public class SpringAppLoader implements Plugin {
                     processor.iface.getClass());
 
             Service service = processor.ifaceClass.getAnnotation(Service.class);
-            assert (service != null); // TODO
+            // TODO
+            assert (service != null);
 
-            ServiceInfo serviceInfo = new ServiceInfo(service.name(), service.version(),
-                    "service", ifaceClass);
-            serviceInfoMap.put(processorKey, serviceInfo);
+            /**
+             * customConfig 封装到 ServiceInfo 中
+             */
+            Map<String, Optional<CustomConfigInfo>> methodsConfigMap = new HashMap<>();
+
+            processor.functions.forEach((key, function) -> {
+                methodsConfigMap.put(key, function.getCustomConfigInfo());
+            });
+
+            //判断有没有 接口实现的版本号   默认为IDL定义的版本号
+            ServiceVersion serviceVersionAnnotation = ifaceClass.isAnnotationPresent(ServiceVersion.class) ? ifaceClass.getAnnotationsByType(ServiceVersion.class)[0] : null;
+            String version = serviceVersionAnnotation != null ? serviceVersionAnnotation.version() : service.version();
+
+            //封装方法的慢服务时间
+            HashMap<String, Long> methodsMaxProcessTimeMap = new HashMap<>(16);
+            Arrays.asList(ifaceClass.getMethods()).forEach(item -> {
+                if (processor.functions.keySet().contains(item.getName())) {
+                    long maxProcessTime = SoaSystemEnvProperties.SOA_MAX_PROCESS_TIME;
+                    maxProcessTime = item.isAnnotationPresent(MaxProcessTime.class) ? item.getAnnotation(MaxProcessTime.class).maxTime() : maxProcessTime;
+                    if (LOGGER.isInfoEnabled()) {
+                        LOGGER.info("{}:{}:{} ; maxProcessTime:{} ", service.name(), version, item.getName(), maxProcessTime);
+                    }
+                    methodsMaxProcessTimeMap.put(item.getName(), maxProcessTime);
+                }
+            });
+
+            if (serviceVersionAnnotation == null || serviceVersionAnnotation.isRegister()) {
+                ServiceInfo serviceInfo = new ServiceInfo(service.name(), version, "service", ifaceClass, processor.getConfigInfo(), methodsConfigMap, methodsMaxProcessTimeMap);
+                serviceInfoMap.put(processorKey, serviceInfo);
+            }
+
         }
-
         return serviceInfoMap;
     }
 
@@ -162,8 +198,7 @@ public class SpringAppLoader implements Plugin {
                 xmlPaths.add(nextElement.toString());
             }
         }
-        Object context = constructor.newInstance(new Object[]{xmlPaths.toArray(new String[0])});
-        return context;
+        return constructor.newInstance(new Object[]{xmlPaths.toArray(new String[0])});
     }
 
 }

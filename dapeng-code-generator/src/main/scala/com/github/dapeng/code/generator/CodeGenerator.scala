@@ -16,13 +16,15 @@ import scala.xml.{Atom, Elem, Node, Text}
   */
 abstract class CodeGenerator {
 
+
+  val XML_REGEN_COUNT = 5
   val lt = "<"
   val gt = ">"
   val and = "&"
 
-  def generate(services: util.List[Service], outDir: String);
+  def generate(services: util.List[Service], outDir: String)
 
-  def generate(services: util.List[Service], outDir: String, generateAll:Boolean, structs:util.List[Struct], enums:util.List[TEnum]);
+  def generate(services: util.List[Service], outDir: String, generateAll:Boolean, structs:util.List[Struct], enums:util.List[TEnum])
 
   protected def toStructArrayBuffer(array: util.List[Struct]): ArrayBuffer[Struct] = {
     val newArray: ArrayBuffer[Struct] = ArrayBuffer()

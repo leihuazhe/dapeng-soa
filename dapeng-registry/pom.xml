@@ -4,8 +4,8 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <parent>
         <artifactId>dapeng-parent</artifactId>
-        <groupId>com.github.dapeng</groupId>
-        <version>2.0.0</version>
+        <groupId>com.github.dapeng-soa</groupId>
+        <version>2.1.0</version>
     </parent>
     <modelVersion>4.0.0</modelVersion>
 
@@ -13,17 +13,33 @@
     <packaging>pom</packaging>
 
     <modules>
-        <module>dapeng-registry-api</module>
         <module>dapeng-registry-zookeeper</module>
     </modules>
 
     <dependencyManagement>
         <dependencies>
             <dependency>
-                <groupId>com.github.dapeng</groupId>
-                <artifactId>dapeng-registry-api</artifactId>
+                <groupId>com.github.dapeng-soa</groupId>
+                <artifactId>dapeng-core</artifactId>
                 <version>${project.version}</version>
             </dependency>
+
+            <dependency>
+                <groupId>com.github.dapeng-soa</groupId>
+                <artifactId>dapeng-utils</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.github.dapeng-soa</groupId>
+                <artifactId>dapeng-router</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.github.dapeng-soa</groupId>
+                <artifactId>dapeng-container-api</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+
         </dependencies>
     </dependencyManagement>
 </project>

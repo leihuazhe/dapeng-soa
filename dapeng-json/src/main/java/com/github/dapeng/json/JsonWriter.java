@@ -1,5 +1,8 @@
 package com.github.dapeng.json;
 
+/**
+ * thrift -> json
+ */
 public class JsonWriter implements JsonCallback {
 
     private StringBuilder builder = new StringBuilder(64);
@@ -11,9 +14,7 @@ public class JsonWriter implements JsonCallback {
 
     @Override
     public void onEndObject() {
-        if (builder.charAt(builder.length() - 1) == ',') {
-            builder.setLength(builder.length() - 1);
-        }
+        removeTailSplitor();
         builder.append('}');
     }
 
@@ -24,15 +25,17 @@ public class JsonWriter implements JsonCallback {
 
     @Override
     public void onEndArray() {
-        if (builder.charAt(builder.length() - 1) == ',') {
-            builder.setLength(builder.length() - 1);
-        }
+        removeTailSplitor();
         builder.append(']');
     }
 
     @Override
     public void onStartField(String name) {
         builder.append('\"').append(name).append('\"').append(':');
+    }
+
+    @Override
+    public void onStartField(int index) {
     }
 
     @Override
@@ -51,31 +54,68 @@ public class JsonWriter implements JsonCallback {
     }
 
     @Override
+    public void onNumber(long value) {
+        builder.append(value);
+    }
+
+    @Override
     public void onNull() {
         builder.append("null");
     }
 
     @Override
     public void onString(String value) {
-        builder.append('\"').append(escapeString(value)).append('\"');
+        builder.append('\"');
+        escapeString(value, builder);
+        builder.append('\"');
+    }
+
+    private void removeTailSplitor() {
+        int position = builder.length() - 1;
+        if (builder.charAt(position) == ',') {
+            builder.setLength(position);
+        }
     }
 
     /**
      * 对回车以及双引号做转义
+     * <p>
+     * """\t\n\r"\"""
+     * <p>
+     * escapeString("\n\"\\") == "\\n\\"\\\\"
      *
      * @param value
      * @return
      */
-    private String escapeString(String value) {
-        if (value != null) {
-            if (value.contains("\n")) {
-                value = value.replaceAll("[\n\r]", "\\\\n");
-            }
-            if (value.contains("\"")) {
-                value = value.replaceAll("\"", "\\\\\"");
-            }
+    private void escapeString(String value, StringBuilder sb) {
+        if (value != null && value.length() > 0) {
+            int length = value.length();
+
+            int index = 0;
+            do {
+                char ch = value.charAt(index++);
+                switch (ch) {
+                    case '\n':
+                        sb.append("\\n");
+                        break;
+                    case '\t':
+                        sb.append("\\t");
+                        break;
+                    case '\r':
+                        sb.append("\\r");
+                        break;
+                    case '"':
+                        sb.append("\\\"");
+                        break;
+                    case '\\':
+                        sb.append("\\\\");
+                        break;
+                    default:
+                        sb.append(ch);
+                }
+
+            } while (index < length);
         }
-        return value;
     }
 
     @Override

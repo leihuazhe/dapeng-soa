@@ -16,6 +16,7 @@ import com.twitter.scrooge.java_generator._
 import scala.collection.JavaConversions._
 import scala.collection.concurrent.TrieMap
 import scala.collection.mutable
+import scala.io.Source
 import scala.util.control.Breaks._
 
 
@@ -51,9 +52,9 @@ class ThriftCodeParser(var language: String) {
       var int = lastIndexCount
       var beginStr = namespace
       var endStr = ""
-      while ((int >= 0) ) {
+      while ((int >= 0)) {
         endStr = s"${beginStr.substring(beginStr.lastIndexOf("."))}${endStr}"
-        beginStr = beginStr.substring(0,beginStr.lastIndexOf("."))
+        beginStr = beginStr.substring(0, beginStr.lastIndexOf("."))
         int -= 1
       }
       s"${beginStr}.scala${endStr}"
@@ -76,12 +77,16 @@ class ThriftCodeParser(var language: String) {
     //如果是scala，需要重写namespace
     val finalTxt = if (language.equals("scala")) {
       // getNamespaceLine => "namespace java xxxxxx.xx.xx"
-      val namespaceLine = txt.split("\n")(0)
-      // getNamespace => xx.xx.xx
-      val namespace = namespaceLine.split(" ").reverse.head
-      val scalaNamespace = toScalaNamespace(namespace)
-
-      txt.replace(namespace,scalaNamespace)
+      val namespaceLine = Source.fromFile(resource).getLines().find(_.trim.startsWith("namespace"))
+      namespaceLine match {
+        case Some(i) =>
+          val namespace = i.split(" ").reverse.head
+          val scalaNamespace = toScalaNamespace(namespace)
+          txt.replace(namespace,scalaNamespace)
+        case None =>
+          println("[Warning] you should specific your namespace statement at head of your thrift file. like: namespace java YourPackageName")
+          txt
+      }
     } else txt
 
     val importer = Importer(Seq(homeDir))
@@ -228,10 +233,10 @@ class ThriftCodeParser(var language: String) {
     dataType
   }
 
-  private def getNameSpace(doc: Document, language:String): Option[Identifier] = {
+  private def getNameSpace(doc: Document, language: String): Option[Identifier] = {
     doc.namespace(language) match {
       case x@Some(id) => x
-      case None =>  // return a default namespace of java
+      case None => // return a default namespace of java
         doc.namespace("java")
     }
 
@@ -278,46 +283,48 @@ class ThriftCodeParser(var language: String) {
     results
   }
 
-  private def findStructs(doc0: Document, generator: ApacheJavaGenerator): List[metadata.Struct] =
+  private def findStructs(doc0: Document, generator: ApacheJavaGenerator): List[metadata.Struct] = {
     doc0.structs.toList.map { (struct: StructLike) =>
       val controller = new StructController(struct, false, generator, getNameSpace(doc0, language))
 
-      new metadata.Struct {
-        //this.setNamespace(if (controller.has_non_nullable_fields) controller.namespace else null)
-        this.setNamespace(controller.namespace)
-        this.setName(controller.name)
-        this.setDoc(toDocString(struct.docstring))
-
-        if (struct.annotations.size > 0)
-          this.setAnnotations(struct.annotations.map { case (key, value) => new Annotation(key, value) }.toList)
-
-        val fields0 = controller.allFields.zip(controller.fields).toList.map { case (field, fieldController) =>
-          val tag0 = field.index.toString.toInt
-          val name0 = field.originalName
-          //val optional0 = fieldController.optional_or_nullable.toString.toBoolean
-          val optional0 = field.requiredness.isOptional
-          val docSrting0 = toDocString(field.docstring)
-          var dataType0: DataType = null
-
-          dataType0 = toDataType(field.fieldType, doc0, docSrting0)
-
-          new metadata.Field {
-            this.setTag(tag0)
-            this.setName(name0)
-            this.setOptional(optional0)
-            this.setDoc(docSrting0)
-            this.setDataType(dataType0)
-            this.setPrivacy(false)
-
-            if (field.fieldAnnotations.size > 0)
-              this.setAnnotations(field.fieldAnnotations.map { case (key, value) => new Annotation(key, value) }.toList)
-
-          }
-        }
-
-        this.setFields(fields0)
+      val domStruct = new metadata.Struct
+      domStruct.setNamespace(controller.namespace)
+      domStruct.setName(controller.name)
+      domStruct.setDoc(toDocString(struct.docstring))
+      if (struct.annotations.size > 0) {
+        domStruct.setAnnotations(struct.annotations.map { case (key, value) => new Annotation(key, value) }.toList)
       }
+
+      val fields0 = controller.allFields.zip(controller.fields).toList.map { case (field, fieldController) =>
+        val tag0 = field.index.toString.toInt
+        val name0 = field.originalName
+        //val optional0 = fieldController.optional_or_nullable.toString.toBoolean
+        val optional0 = field.requiredness.isOptional
+        val docSrting0 = toDocString(field.docstring)
+        var dataType0: DataType = null
+
+        dataType0 = toDataType(field.fieldType, doc0, docSrting0)
+
+        val domField = new metadata.Field
+        domField.setTag(tag0)
+        domField.setName(name0)
+        domField.setOptional(optional0)
+        domField.setDoc(docSrting0)
+        domField.setDataType(dataType0)
+        domField.setPrivacy(false)
+
+        if (field.fieldAnnotations.size > 0) {
+          domField.setAnnotations(field.fieldAnnotations.map { case (key, value) => new Annotation(key, value) }.toList)
+        }
+        domField
+      }
+
+      domStruct.setFields(fields0)
+
+      domStruct
     }
+
+  }
 
 
   private def findServices(doc: Document, generator: ApacheJavaGenerator): util.List[metadata.Service] = {
@@ -328,11 +335,25 @@ class ThriftCodeParser(var language: String) {
 
       val service = new metadata.Service()
 
+
       service.setNamespace(if (controller.has_namespace) controller.namespace else null)
       service.setName(controller.name)
       service.setDoc(toDocString(s.docstring))
       if (s.annotations.size > 0)
         service.setAnnotations(s.annotations.map { case (key, value) => new Annotation(key, value) }.toList)
+
+
+      val serviceVersion = if(service.annotations != null) service.annotations.find(item => {item.key.contains("version")}) else None
+      service.setMeta(new metadata.Service.ServiceMeta {
+        if (serviceVersion.nonEmpty) {
+          this.version = serviceVersion.get.value
+        } else {
+          this.version = "1.0.0"
+        }
+        this.timeout = 30000
+      })
+
+
 
       val methods = new util.ArrayList[Method]()
       for (tmpIndex <- (0 until controller.functions.size)) {
@@ -482,21 +503,18 @@ class ThriftCodeParser(var language: String) {
           getAllStructs(field.getDataType, structSet)
           getAllEnums(field.getDataType, enumSet, loadedStructs)
         }
+
+        if (method.annotations != null) {
+          method.annotations.foreach(annotation => getAllStructByAnnotation(annotation.getValue, structSet))
+        }
+
       }
       service.setStructDefinitions(structSet.toList)
       service.setEnumDefinitions(enumSet.toList)
       //      service.setEnumDefinitions(enumCache)
       //      service.setStructDefinitions(structCache)
-      service.setMeta(new metadata.Service.ServiceMeta {
-        if (serviceVersion != null && !serviceVersion.trim.equals(""))
-          this.version = serviceVersion.trim
-        else
-          this.version = "1.0.0"
-        this.timeout = 30000
-      })
     }
-
-    return serviceCache;
+    return serviceCache
   }
 
   /**
@@ -526,6 +544,29 @@ class ThriftCodeParser(var language: String) {
       getAllStructs(dataType.getKeyType, structSet)
       getAllStructs(dataType.getValueType, structSet)
     }
+  }
+
+  /**
+    * qualifiedName:
+    *
+    * @param annoValue
+    * @param structSet
+    * @return
+    */
+  def getAllStructByAnnotation(annoValue: String, structSet: java.util.HashSet[metadata.Struct]) = {
+    annoValue.split(",").foreach(qualifiedName => {
+      val finalQualifiedName = if (language.equals("scala")) {
+        if (qualifiedName.contains(".")) {
+          toScalaNamespace(qualifiedName, 1)
+        } else qualifiedName
+      } else {
+        qualifiedName
+      }
+      val struct = mapStructCache.get(finalQualifiedName);
+      if (struct != null && !structSet.contains(struct)) {
+        structSet.add(struct)
+      }
+    })
   }
 
   /**

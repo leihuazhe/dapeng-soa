@@ -1,7 +1,9 @@
 package com.github.dapeng.client.netty;
 
 import com.github.dapeng.core.SoaConnection;
+import com.github.dapeng.core.helper.SoaSystemEnvProperties;
 
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -10,8 +12,7 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public class SubPool {
 
-    private final ReentrantLock connectionLock = new ReentrantLock();
-    private final ReentrantLock jsonConnectionlock = new ReentrantLock();
+    static final int MAX = SoaSystemEnvProperties.SOA_SUBPOOL_SIZE;
 
     private final String ip;
     private final int port;
@@ -19,49 +20,31 @@ public class SubPool {
     /**
      * connection that used by rpcClients, such as java, scala, php..
      */
-    private SoaConnection normalConnection;
-
-    /**
-     * connection that used by json based httpClients.
-     */
-    private SoaConnection jsonConnection;
+    private final SoaConnection[] soaConnections;
+    private final AtomicInteger index = new AtomicInteger(0);
 
     SubPool(String ip, int port) {
         this.ip = ip;
         this.port = port;
+
+        soaConnections = new SoaConnection[MAX];
+        for(int i = 0; i < MAX; i++) {
+            soaConnections[i] = new SoaConnectionImpl(ip, port);
+        }
     }
 
-    /**
-     * @param connectionType
-     * @return
-     */
-    public SoaConnection getConnection(ConnectionType connectionType) {
-        switch (connectionType) {
-            case Json:
-                if (jsonConnection != null) return jsonConnection;
-                try {
-                    jsonConnectionlock.lock();
-                    if (jsonConnection == null) {
-                        jsonConnection = new SoaJsonConnectionImpl(ip, port);
-                    }
-                } finally {
-                    jsonConnectionlock.unlock();
-                }
-
-                return jsonConnection;
-            case Common:
-                if (normalConnection != null) return normalConnection;
-                try {
-                    connectionLock.lock();
-                    if (normalConnection == null) {
-                        normalConnection = new SoaConnectionImpl(ip, port);
-                    }
-                } finally {
-                    connectionLock.unlock();
-                }
-                return normalConnection;
-            default:
-                return null;
+    public SoaConnection getConnection() {
+        if (MAX == 1) {
+            return soaConnections[0];
         }
+
+        int idx = this.index.getAndIncrement();
+        if(idx < 0) {
+            synchronized (this){
+                this.index.set(0);
+                idx = 0;
+            }
+        }
+        return soaConnections[idx%MAX];
     }
 }

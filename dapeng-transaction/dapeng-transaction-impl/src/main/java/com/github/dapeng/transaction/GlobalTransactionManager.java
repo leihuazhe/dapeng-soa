@@ -6,6 +6,7 @@ import com.github.dapeng.core.InvocationContextImpl;
 import com.github.dapeng.core.SoaException;
 import com.github.dapeng.core.helper.MasterHelper;
 import com.github.dapeng.core.metadata.Service;
+import com.github.dapeng.json.OptimizedMetadata;
 import com.github.dapeng.metadata.MetadataClient;
 import com.github.dapeng.transaction.api.domain.*;
 import com.github.dapeng.transaction.api.service.GlobalTransactionProcessService;
@@ -19,7 +20,6 @@ import javax.xml.bind.JAXB;
 import java.io.StringReader;
 import java.util.Date;
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static java.util.stream.Collectors.toList;
@@ -249,31 +249,31 @@ public class GlobalTransactionManager {
     private static String callServiceMethod(TGlobalTransactionProcess process, boolean rollbackOrForward) throws Exception {
 
         String responseJson;
-        Service service = null;
+        OptimizedMetadata.OptimizedService service = null;
 
         //获取服务的metadata
         String metadata = new MetadataClient(process.getServiceName(), process.getVersionName()).getServiceMetadata();
         if (metadata != null) {
             try (StringReader reader = new StringReader(metadata)) {
-                service = JAXB.unmarshal(reader, Service.class);
+                service = new OptimizedMetadata.OptimizedService(JAXB.unmarshal(reader, Service.class));
             }
         }
 
         //获取服务的ip和端口
-        JsonPost jsonPost = new JsonPost(process.getServiceName(), process.getVersionName());
+        JsonPost jsonPost = new JsonPost(process.getServiceName(), process.getVersionName(), process.getMethodName());
 
-        InvocationContext invocationContext = InvocationContextImpl.Factory.getCurrentInstance();
-        invocationContext.setServiceName(process.getServiceName());
-        invocationContext.setVersionName(process.getVersionName());
-        invocationContext.setMethodName(rollbackOrForward ? process.getRollbackMethodName() : process.getMethodName());
-        invocationContext.setCallerFrom(Optional.of("GlobalTransactionManager"));
-        invocationContext.setTransactionId(Optional.of(process.getTransactionId()));
-        invocationContext.setTransactionSequence(Optional.of(process.getTransactionSequence()));
+        InvocationContextImpl invocationContext = (InvocationContextImpl)InvocationContextImpl.Factory.currentInstance();
+        invocationContext.serviceName(process.getServiceName());
+        invocationContext.versionName(process.getVersionName());
+        invocationContext.methodName(rollbackOrForward ? process.getRollbackMethodName() : process.getMethodName());
+        invocationContext.callerMid("GlobalTransactionManager");
+        invocationContext.transactionId(process.getTransactionId());
+        invocationContext.transactionSequence(process.getTransactionSequence());
 
         if (rollbackOrForward) {
-            responseJson = jsonPost.callServiceMethod(invocationContext, "", service);
+            responseJson = jsonPost.callServiceMethod("{}", service);
         } else {
-            responseJson = jsonPost.callServiceMethod(invocationContext, process.getRequestJson(), service);
+            responseJson = jsonPost.callServiceMethod(process.getRequestJson(), service);
         }
 
         return responseJson;

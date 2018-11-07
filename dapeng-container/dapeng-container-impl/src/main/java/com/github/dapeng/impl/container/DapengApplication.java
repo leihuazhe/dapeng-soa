@@ -3,6 +3,7 @@ package com.github.dapeng.impl.container;
 
 import com.github.dapeng.core.Application;
 import com.github.dapeng.core.ServiceInfo;
+import com.github.dapeng.core.helper.SoaSystemEnvProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,17 +45,25 @@ public class DapengApplication implements Application {
 
     @Override
     public void addServiceInfos(List<ServiceInfo> serviceInfos) {
+        LOGGER.info(getClass().getSimpleName() + "::addServiceInfos serviceInfos[" + serviceInfos + "]");
         this.serviceInfos.addAll(serviceInfos);
     }
 
     @Override
     public void addServiceInfo(ServiceInfo serviceInfo) {
+        LOGGER.info(getClass().getSimpleName() + "::addServiceInfo serviceInfo[" + serviceInfo + "]");
         this.serviceInfos.add(serviceInfo);
     }
 
     @Override
     public Optional<ServiceInfo> getServiceInfo(String name, String version) {
-        return serviceInfos.stream().filter(i -> name.equals(i.serviceName) && version.equals(i.version)).findFirst();
+        for (int i = 0; i < serviceInfos.size(); i++) {
+            ServiceInfo serviceInfo = serviceInfos.get(i);
+            if (name.equals(serviceInfo.serviceName) && version.equals(serviceInfo.version)) {
+                return Optional.of(serviceInfo);
+            }
+        }
+        return Optional.empty();
     }
 
     @Override

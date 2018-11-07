@@ -1,69 +1,116 @@
 package com.github.dapeng.client.netty;
 
-import com.github.dapeng.api.ContainerFactory;
 import com.github.dapeng.core.*;
-import com.github.dapeng.core.ServiceInfo;
-import com.github.dapeng.json.JsonSerializer;
-import com.github.dapeng.registry.*;
-import com.github.dapeng.registry.zookeeper.LoadBalanceService;
-import com.github.dapeng.registry.zookeeper.ZkClientAgentImpl;
-import com.github.dapeng.util.SoaSystemEnvProperties;
+import com.github.dapeng.core.enums.LoadBalanceStrategy;
+import com.github.dapeng.core.helper.IPUtils;
+import com.github.dapeng.core.helper.SoaSystemEnvProperties;
+import com.github.dapeng.registry.ConfigKey;
+import com.github.dapeng.registry.zookeeper.ClientZkAgent;
+import com.github.dapeng.registry.zookeeper.ClientZkAgentImpl;
+import com.github.dapeng.registry.zookeeper.LoadBalanceAlgorithm;
+import com.github.dapeng.registry.zookeeper.ZkServiceInfo;
+import com.github.dapeng.router.Route;
+import com.github.dapeng.router.RoutesExecutor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.lang.annotation.Annotation;
+import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
-import java.lang.reflect.Method;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
-import java.util.concurrent.locks.ReentrantLock;
-import java.util.stream.Collectors;
+
+import static com.github.dapeng.core.SoaCode.*;
 
 /**
- *
  * @author lihuimin
  * @date 2017/12/22
  */
 public class SoaConnectionPoolImpl implements SoaConnectionPool {
-
-    private Map<String, ServiceZKInfo> zkInfos = new ConcurrentHashMap<>();
-    private Map<IpPort, SubPool> subPools = new ConcurrentHashMap<>();
-    private ZkClientAgent zkAgent = new ZkClientAgentImpl();
-
-    private ReentrantLock subPoolLock = new ReentrantLock();
-
     private final Logger logger = LoggerFactory.getLogger(SoaConnectionPoolImpl.class);
+    private final LoadBalanceStrategy DEFAULT_LB_STRATEGY = LoadBalanceStrategy.Random;
 
-    //TODO
-    List<WeakReference<ClientInfo>> clientInfos;
+    class ClientInfoWeakRef extends WeakReference<SoaConnectionPool.ClientInfo> {
+        final String serviceName;
+        final String version;
 
-    // TODO connection idle process.
-    Thread cleanThread = null;  // clean idle connections;
-    // TODO ClientInfo clean.
+        ClientInfoWeakRef(SoaConnectionPool.ClientInfo referent,
+                          ReferenceQueue<? super SoaConnectionPool.ClientInfo> q) {
+            super(referent, q);
+            this.serviceName = referent.serviceName;
+            this.version = referent.version;
+        }
+    }
+
+    private ClientZkAgent zkAgent = new ClientZkAgentImpl();
+
+    private Map<String, ClientInfoWeakRef> clientInfos = new ConcurrentHashMap<>(16);
+    private final ReferenceQueue<ClientInfo> referenceQueue = new ReferenceQueue<>();
+    /**
+     * 重用 ZkServiceInfo , 每一个 serviceName 对应 唯一一个ZkServiceInfo实例.
+     */
+    private Map<String, ZkServiceInfo> zkServiceInfoMap = new ConcurrentHashMap<>(128);
+
+
+    Thread cleanThread = new Thread(() -> {
+        while (true) {
+            try {
+                ClientInfoWeakRef clientInfoRef = (ClientInfoWeakRef) referenceQueue.remove(1000);
+                if (clientInfoRef == null) continue;
+
+                final String key = clientInfoRef.serviceName + ":" + clientInfoRef.version;
+
+                if (logger.isDebugEnabled()) {
+                    logger.debug("client for service:" + key + " is gone.");
+                }
+
+                clientInfos.remove(key);
+
+                ZkServiceInfo zkServiceInfo = zkServiceInfoMap.get(clientInfoRef.serviceName);
+
+                if (zkServiceInfo != null) {
+                    zkAgent.cancelSyncService(zkServiceInfo);
+                }
+            } catch (Throwable e) {
+                logger.error(e.getMessage(), e);
+            }
+        }
+    }, "dapeng-clientInfo-monitor-thread");
+
 
     public SoaConnectionPoolImpl() {
         IdleConnectionManager connectionManager = new IdleConnectionManager();
         connectionManager.start();
-    }
 
-
-    private boolean checkVersion(String reqVersion, String targetVersion) {
-        // x.y.z
-        // x.Y.Z Y.Z >= y.z
-        return true;
+        cleanThread.setDaemon(true);
+        cleanThread.start();
     }
 
     @Override
-    public ClientInfo registerClientInfo(String serviceName, String version) {
-        // TODO
-        // clientInfos.add(new WeakReference<ClientInfo>(client));
+    public synchronized ClientInfo registerClientInfo(String serviceName, String version) {
+        final String key = serviceName + ":" + version;
 
-        zkAgent.syncService(serviceName, zkInfos);
-        return null;
+        ClientInfoWeakRef clientInfoRef = clientInfos.get(key);
+        ClientInfo clientInfo = (clientInfoRef == null) ? null : clientInfoRef.get();
+        if (clientInfo != null) {
+            return clientInfo;
+        } else {
+            clientInfo = new ClientInfo(serviceName, version);
+            clientInfoRef = new ClientInfoWeakRef(clientInfo, referenceQueue);
+
+            clientInfos.put(key, clientInfoRef);
+
+            ZkServiceInfo zkInfo = zkServiceInfoMap.get(serviceName);
+            if (zkInfo == null) {
+                zkInfo = new ZkServiceInfo(serviceName, new ArrayList<>());
+                zkServiceInfoMap.put(serviceName, zkInfo);
+            }
+
+            zkAgent.syncService(zkInfo);
+
+            return clientInfo;
+        }
+
     }
 
     @Override
@@ -72,13 +119,17 @@ public class SoaConnectionPoolImpl implements SoaConnectionPool {
                                  BeanSerializer<REQ> requestSerializer,
                                  BeanSerializer<RESP> responseSerializer)
             throws SoaException {
-        ConnectionType connectionType = getConnectionType(requestSerializer);
-        SoaConnection connection = findConnection(service, version, method, connectionType);
+        SoaConnection connection = retryFindConnection(service, version, method);
+        // 选好的服务版本(可能不同于请求的版本)
+        String serverVersion = InvocationContextImpl.Factory.currentInstance().versionName();
         if (connection == null) {
-            throw new SoaException(SoaCode.NotConnected);
+            throw new SoaException(SoaCode.NotFoundServer, "服务 [ " + service + " ] 无可用实例");
         }
-        long timeout = getTimeout(service, version, method);
-        return connection.send(service, version, method, request, requestSerializer, responseSerializer, timeout);
+        long timeout = getTimeout(service, method);
+        if (logger.isDebugEnabled()) {
+            logger.debug("findConnection:serviceName:{},methodName:{},version:[{} -> {}] ,TimeOut:{}", service, method, version, serverVersion, timeout);
+        }
+        return connection.send(service, serverVersion, method, request, requestSerializer, responseSerializer, timeout);
     }
 
     @Override
@@ -89,73 +140,243 @@ public class SoaConnectionPoolImpl implements SoaConnectionPool {
                                               BeanSerializer<REQ> requestSerializer,
                                               BeanSerializer<RESP> responseSerializer) throws SoaException {
 
-        ConnectionType connectionType = getConnectionType(requestSerializer);
-        SoaConnection connection = findConnection(service, version,
-                method, connectionType);
+        SoaConnection connection = retryFindConnection(service, version, method);
+
+        String serverVersion = InvocationContextImpl.Factory.currentInstance().versionName();
         if (connection == null) {
-            throw new SoaException(SoaCode.NotConnected);
+            throw new SoaException(SoaCode.NotFoundServer, "服务 [ " + service + " ] 无可用实例");
         }
-        long timeout = getTimeout(service, version, method);
-        return connection.sendAsync(service, version, method, request, requestSerializer, responseSerializer, timeout);
+        long timeout = getTimeout(service, method);
+        if (logger.isDebugEnabled()) {
+            logger.debug("findConnection:serviceName:{},methodName:{},version:[{} -> {}] ,TimeOut:{}", service, method, version, serverVersion, timeout);
+        }
+        return connection.sendAsync(service, serverVersion, method, request, requestSerializer, responseSerializer, timeout);
     }
 
-    private SoaConnection findConnection(String service,
-                                         String version,
-                                         String method,
-                                         ConnectionType connectionType) {
-        ServiceZKInfo zkInfo = zkInfos.get(service);
+    @Override
+    public RuntimeInstance getRuntimeInstance(String serviceName, String serviceIp, int servicePort) {
+        ZkServiceInfo zkInfo = zkServiceInfoMap.get(serviceName);
+        if (zkInfo == null) {
+            return null;
+        }
+        List<RuntimeInstance> runtimeInstances = zkInfo.getRuntimeInstances();
+        for (RuntimeInstance runtimeInstance : runtimeInstances) {
+            if (runtimeInstance.ip.equals(serviceIp) && runtimeInstance.port == servicePort) {
+                return runtimeInstance;
+            }
+        }
+        return null;
+    }
 
-        List<RuntimeInstance> compatibles = zkInfo.getRuntimeInstances().stream()
-                .filter(rt -> checkVersion(version, rt.version))
-                .collect(Collectors.toList());
+    private SoaConnection findConnection(final String service,
+                                         final String version,
+                                         final String method) throws SoaException {
 
-        String serviceKey = service + "." + version + "." + method + ".consumer";
-        RuntimeInstance inst = loadbalance(serviceKey, compatibles);
+        InvocationContextImpl context = (InvocationContextImpl) InvocationContextImpl.Factory.currentInstance();
 
-        if (inst == null) {
+        ZkServiceInfo zkInfo = zkServiceInfoMap.get(service);
+
+
+        //设置慢服务检测时间阈值
+        /*Optional<Long> maxProcessTime = getZkProcessTime(method, zkInfo);
+        context.maxProcessTime(maxProcessTime.orElse(null));*/
+        // TODO: 2018-10-12 慢服务时间 取自超时时间[TimeOut]
+        context.maxProcessTime(getTimeout(service, method));
+
+        //如果设置了calleeip 和 calleport 直接调用服务 不走路由
+        if (context.calleeIp().isPresent() && context.calleePort().isPresent()) {
+            return SubPoolFactory.getSubPool(IPUtils.transferIp(context.calleeIp().get()), context.calleePort().get()).getConnection();
+        }
+
+        if (zkInfo == null || zkInfo.getStatus() != ZkServiceInfo.Status.ACTIVE) {
+            //todo should find out why zkInfo is null
+            // 1. target service not exists
+            logger.error(getClass().getSimpleName() + "::findConnection-0[service: " + service + "], zkInfo not found, now reSyncService");
+
+            if (zkInfo == null) {
+                synchronized (this) {
+                    zkInfo = zkServiceInfoMap.get(service);
+                    if (zkInfo == null) {
+                        zkInfo = new ZkServiceInfo(service, new ArrayList<>());
+                        zkServiceInfoMap.put(service, zkInfo);
+                    }
+                }
+            }
+
+            zkAgent.syncService(zkInfo);
+            if (zkInfo.getStatus() != ZkServiceInfo.Status.ACTIVE) {
+                logger.error(getClass().getSimpleName() + "::findConnection-1[service: " + service + "], zkInfo not found");
+                return null;
+            }
+        }
+        //当zk上服务节点发生变化的时候, 可能会导致拿到不存在的服务运行时实例或者根本拿不到任何实例.
+        List<RuntimeInstance> compatibles = new ArrayList<>(zkInfo.getRuntimeInstances());
+        if (compatibles == null || compatibles.isEmpty()) {
             return null;
         }
 
-        inst.getActiveCount().incrementAndGet();
-
-        IpPort ipPort = new IpPort(inst.ip, inst.port);
-        SubPool subPool = subPools.get(ipPort);
-        if (subPool == null) {
-            try {
-                subPoolLock.lock();
-                subPool = subPools.get(ipPort);
-                if (subPool == null) {
-                    subPool = new SubPool(inst.ip, inst.port);
-                    subPools.put(ipPort, subPool);
-                }
-            } finally {
-                subPoolLock.unlock();
+        // checkVersion
+        List<RuntimeInstance> checkVersionInstances = new ArrayList<>(8);
+        for (RuntimeInstance rt : compatibles) {
+            if (checkVersion(version, rt.version)) {
+                checkVersionInstances.add(rt);
             }
         }
 
-        return subPool.getConnection(connectionType);
+        if (checkVersionInstances.isEmpty()) {
+            logger.error(getClass().getSimpleName() + "::findConnection[service: " + service + ":" + version + "], not found available version of instances");
+            throw new SoaException(NoMatchedService, "服务 [ " + service + ":" + version + "] 无可用实例:没有找到对应的服务版本");
+        }
+
+        // router
+        List<RuntimeInstance> routedInstances = router(service, method, version, checkVersionInstances);
+        if (routedInstances == null || routedInstances.isEmpty()) {
+            logger.error(getClass().getSimpleName() + "::findConnection[service: " + service + "], not found available instances by routing rules");
+            throw new SoaException(NoMatchedRouting, "服务 [ " + service + " ] 无可用实例:路由规则没有解析到可运行的实例");
+        }
+
+        //loadBalance
+        RuntimeInstance inst = loadBalance(method, zkInfo, routedInstances);
+        if (inst == null) {
+            // should not reach here
+            throw new SoaException(NotFoundServer, "服务 [ " + service + " ] 无可用实例:负载均衡没有找到合适的运行实例");
+        }
+
+        inst.increaseActiveCount();
+
+        // TODO: 2018-08-04  服务端需要返回来正确的版本号
+        context.versionName(inst.version);
+
+        return SubPoolFactory.getSubPool(inst.ip, inst.port).getConnection();
     }
 
-    private RuntimeInstance loadbalance(String serviceKey, List<RuntimeInstance> compatibles) {
+    /**
+     * 版本 兼容(主版本不兼容，副版本向下兼容)
+     *
+     * @param reqVersion
+     * @param targetVersion
+     * @return
+     */
+    private boolean checkVersion(String reqVersion, String targetVersion) {
+        String[] reqArr = reqVersion.split("[.]");
+        String[] tarArr = targetVersion.split("[.]");
+        if (Integer.parseInt(tarArr[0]) != Integer.parseInt(reqArr[0])) {
+            return false;
+        }
+        return ((Integer.parseInt(tarArr[1]) * 10 + Integer.parseInt(tarArr[2]))
+                >= (Integer.parseInt(reqArr[1]) * 10 + Integer.parseInt(reqArr[2])));
+    }
 
-        boolean usingFallbackZookeeper = SoaSystemEnvProperties.SOA_ZOOKEEPER_FALLBACK_ISCONFIG;
-        LoadBalanceStratage balance = LoadBalanceStratage.Random;
+    /**
+     * 服务路由
+     *
+     * @param service
+     * @param method
+     * @param version
+     * @param compatibles
+     * @return
+     */
+    private List<RuntimeInstance> router(String service, String method, String version, List<RuntimeInstance> compatibles) throws SoaException {
+        InvocationContextImpl context = (InvocationContextImpl) InvocationContextImpl.Factory.currentInstance();
+        List<Route> routes = zkAgent.getRoutes(service);
+        if (routes == null || routes.size() == 0) {
+            logger.debug("router 获取 路由信息为空或size为0,跳过router,服务实例数：{}", compatibles.size());
+            return compatibles;
+        } else {
+            context.serviceName(service);
+            context.methodName(method);
+            context.versionName(version);
+            List<RuntimeInstance> runtimeInstances = RoutesExecutor.executeRoutes(context, routes, compatibles);
+            if (runtimeInstances.size() == 0) {
+                throw new SoaException(SoaCode.NoMatchedRouting);
+            }
+            return runtimeInstances;
+        }
+    }
 
-        Map<ConfigKey, Object> configs = zkAgent.getConfig(usingFallbackZookeeper, serviceKey);
-        if (null != configs) {
-            balance = LoadBalanceStratage.findByValue((String) configs.get(ConfigKey.LoadBalance));
+    /**
+     * 如果出现异常（ConcurrentModifyException）,或获取到的实例为0，进行重试
+     */
+    private SoaConnection retryFindConnection(final String service,
+                                              final String version,
+                                              final String method) throws SoaException {
+        SoaConnection soaConnection;
+        int retry = 1;
+        do {
+            try {
+                soaConnection = findConnection(service, version, method);
+                if (soaConnection != null) {
+                    return soaConnection;
+                }
+            } catch (ConcurrentModificationException e) {
+                logger.error("zkInfo get connection 出现异常: " + e.getMessage());
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException ignored) {
+            }
+        } while (retry++ <= 3);
+        logger.warn("retryFindConnection::重试3次获取 connection 失败");
+        return null;
+    }
+
+    /**
+     * 根据zk 负载均衡配置解析，分为 全局/service级别/method级别
+     *
+     * @param methodName
+     * @param zkServiceInfo
+     * @param compatibles
+     * @return
+     */
+    private RuntimeInstance loadBalance(String methodName, ZkServiceInfo zkServiceInfo, List<RuntimeInstance> compatibles) {
+
+        //方法级别
+        LoadBalanceStrategy methodLB = null;
+        //服务配置
+        LoadBalanceStrategy serviceLB = null;
+        //全局
+        LoadBalanceStrategy globalLB = null;
+
+        if (zkServiceInfo != null) {
+            //方法级别
+            methodLB = zkServiceInfo.loadbalanceConfig.serviceConfigs.get(methodName);
+            //服务配置
+            serviceLB = zkServiceInfo.loadbalanceConfig.serviceConfigs.get(ConfigKey.LoadBalance.getValue());
+            //全局
+            globalLB = zkServiceInfo.loadbalanceConfig.globalConfig;
+        }
+
+        InvocationContext invocationContext = InvocationContextImpl.Factory.currentInstance();
+        LoadBalanceStrategy balance = invocationContext.loadBalanceStrategy().orElse(null);
+
+        if (balance == null) {
+            if (methodLB != null) {
+                balance = methodLB;
+            } else if (serviceLB != null) {
+                balance = serviceLB;
+            } else if (globalLB != null) {
+                balance = globalLB;
+            } else {
+                balance = DEFAULT_LB_STRATEGY;
+                invocationContext.loadBalanceStrategy(balance);
+            }
+        }
+
+        if (logger.isDebugEnabled()) {
+            logger.debug("request loadBalance strategy is {}", balance);
         }
 
         RuntimeInstance instance = null;
+
         switch (balance) {
             case Random:
-                instance = LoadBalanceService.random(compatibles);
+                instance = LoadBalanceAlgorithm.random(compatibles);
                 break;
             case RoundRobin:
-                instance = LoadBalanceService.roundRobin(compatibles);
+                instance = LoadBalanceAlgorithm.roundRobin(compatibles);
                 break;
             case LeastActive:
-                instance = LoadBalanceService.leastActive(compatibles);
+                instance = LoadBalanceAlgorithm.leastActive(compatibles);
                 break;
             case ConsistentHash:
                 //TODO
@@ -163,9 +384,7 @@ public class SoaConnectionPoolImpl implements SoaConnectionPool {
             default:
                 // won't be here
         }
-
         return instance;
-
     }
 
     /**
@@ -175,29 +394,30 @@ public class SoaConnectionPoolImpl implements SoaConnectionPool {
      * 3. 没设置Option的话, 那么取ZK的.
      * 4. ZK没有的话, 拿IDL的(暂没实现该参数)
      * 5. 都没有的话, 拿默认值.(这个值所有方法一致, 假设为50S)
-     *
+     * <p>
      * 最后校验一下,拿到的值不能超过系统设置的最大值
      *
-     * @param service
-     * @param version
      * @param method
+     * @param service
      * @return
      */
-    private long getTimeout(String service, String version, String method) {
+    private long getTimeout(String service, String method) {
 
         long maxTimeout = SoaSystemEnvProperties.SOA_MAX_TIMEOUT;
         long defaultTimeout = SoaSystemEnvProperties.SOA_DEFAULT_TIMEOUT;
 
-        Optional<Long> invocationTimeout = getInvocationTimeout();
-        Optional<Long> envTimeout = SoaSystemEnvProperties.SOA_SERVICE_CLIENT_TIMEOUT.longValue() == 0 ?
-                Optional.empty(): Optional.of(SoaSystemEnvProperties.SOA_SERVICE_CLIENT_TIMEOUT.longValue());
+        Optional<Integer> invocationTimeout = getInvocationTimeout();
+        Optional<Long> envTimeout = SoaSystemEnvProperties.SOA_SERVICE_TIMEOUT == 0 ?
+                Optional.empty() : Optional.of(SoaSystemEnvProperties.SOA_SERVICE_TIMEOUT);
 
-        Optional<Long> zkTimeout = getZkTimeout(service,version,method);
-        Optional<Long> idlTimeout = getIdlTimeout(service,version,method);
+        ZkServiceInfo zkServiceInfo = zkServiceInfoMap.get(service);
+
+        Optional<Long> zkTimeout = getZkTimeout(method, zkServiceInfo);
+        Optional<Long> idlTimeout = getIdlTimeout(method);
 
         Optional<Long> timeout;
         if (invocationTimeout.isPresent()) {
-            timeout = invocationTimeout;
+            timeout = invocationTimeout.map(Long::valueOf);
         } else if (envTimeout.isPresent()) {
             timeout = envTimeout;
         } else if (idlTimeout.isPresent()) {
@@ -207,81 +427,118 @@ public class SoaConnectionPoolImpl implements SoaConnectionPool {
         } else {
             timeout = Optional.of(defaultTimeout);
         }
-
         return timeout.get() >= maxTimeout ? maxTimeout : timeout.get();
-
     }
 
-    private Optional<Long> getInvocationTimeout() {
-        InvocationContext context = InvocationContextImpl.Factory.getCurrentInstance();
-        return context.getTimeout() == null ? Optional.empty(): context.getTimeout();
+
+    private Optional<Integer> getInvocationTimeout() {
+        InvocationContext context = InvocationContextImpl.Factory.currentInstance();
+        return context.timeout();
     }
 
-    //TODO
 
     /**
      * 获取服务Idl timeout
+     *
      * @return
      */
-    private Optional<Long> getIdlTimeout(String serviceName, String version, String methodName) {
+    private Optional<Long> getIdlTimeout(String methodName) {
         Optional<Long> timeout = Optional.empty();
 
-        //todo
-//        Application application = ContainerFactory.getContainer().getApplication(new ProcessorKey(serviceName,version));
-//
+//        Application application = ContainerFactory.getContainer().getApplication(new ProcessorKey(serviceName, version));
 //        if (application != null) {
-//            Optional<ServiceInfo> serviceInfo = application.getServiceInfo(serviceName,version);
+//            Optional<ServiceInfo> serviceInfo = application.getServiceInfo(serviceName, version);
 //            if (serviceInfo.isPresent()) {
-//                Class<?> service = serviceInfo.get().ifaceClass;
-//                List<Method> methods =  Arrays.stream(service.getMethods()).filter(method ->
-//                        methodName.equals(method.getName())).collect(Collectors.toList());
-//                if (! methods.isEmpty()) {
-//                    //TODO: 自定义注解类 (Invocation(timeout=xxx))
-//                    Method method = methods.get(0);
-//                    try {
-//                        Class InvocationClass = service.getClassLoader().loadClass("com.github.dapeng.core.Invocation");
-//
-//                        if (method.isAnnotationPresent(InvocationClass)) {
-//                            Annotation annotation = method.getAnnotation(InvocationClass);
-//                            Long annotationTimeout = (Long) annotation.getClass().getDeclaredMethod("timeout").invoke(annotation);
-//                            timeout = Optional.of(annotationTimeout);
-//                        }
-//                    } catch (Exception e) {
-//                        logger.error(" Failed to get method: {}:{}:{} invocation Annotation. ", serviceName,version,method);
-//                    }
-//
+//                // class config
+//                Optional<CustomConfigInfo> classConfigInfo = serviceInfo.get().configInfo;
+//                // method config map
+//                Map<String, Optional<CustomConfigInfo>> methodsConfigMap = serviceInfo.get().methodsMap;
+//                // detail method config
+//                Optional<CustomConfigInfo> methodConfigInfo = methodsConfigMap.get(methodName);
+//                //方法级别 配置
+//                if (methodConfigInfo.isPresent()) {
+//                    timeout = Optional.of(methodConfigInfo.get().timeout);
+//                    //类级别配置
+//                } else if (classConfigInfo.isPresent()) {
+//                    timeout = Optional.of(classConfigInfo.get().timeout);
 //                }
 //            }
 //        }
-
         return timeout;
-
     }
 
     /**
-     *
      * 获取 zookeeper timeout config
+     * <p>
+     * method level -> service level -> global level
+     * <</p>
      *
-     * @param serviceName
-     * @param version
-     * @param methodName
      * @return
      */
-    private Optional<Long> getZkTimeout(String serviceName, String version, String methodName) {
-        String serviceKey = serviceName + "." + version + "." + methodName + ".producer";
-        Map<ConfigKey, Object> configs = zkAgent.getConfig(false, serviceKey);
-        if (null != configs && configs.containsKey(ConfigKey.ClientTimeout)) {
-            Long timeoutConfig = (Long) configs.get(ConfigKey.ClientTimeout);
+    private Optional<Long> getZkTimeout(String methodName, ZkServiceInfo configInfo) {
+        //方法级别
+        Long methodTimeOut = null;
+        //服务配置
+        Long serviceTimeOut = null;
 
-            return timeoutConfig == null ? Optional.empty() : Optional.of(timeoutConfig);
+        Long globalTimeOut = null;
+
+        if (configInfo != null) {
+            //方法级别
+            methodTimeOut = configInfo.timeConfig.serviceConfigs.get(methodName);
+            //服务配置
+            serviceTimeOut = configInfo.timeConfig.serviceConfigs.get(ConfigKey.TimeOut.getValue());
+
+            globalTimeOut = configInfo.timeConfig.globalConfig;
+        }
+
+        if (methodTimeOut != null) {
+
+            return Optional.of(methodTimeOut);
+        } else if (serviceTimeOut != null) {
+
+            return Optional.of(serviceTimeOut);
+        } else if (globalTimeOut != null) {
+
+            return Optional.of(globalTimeOut);
         } else {
             return Optional.empty();
         }
     }
 
 
-    private ConnectionType getConnectionType(BeanSerializer serializer) {
-        return (serializer instanceof JsonSerializer) ? ConnectionType.Json : ConnectionType.Common;
+    /**
+     * 获取 zookeeper processTime config
+     * <p>
+     * method level -> service level -> global level
+     * <</p>
+     *
+     * @return
+     */
+    private Optional<Long> getZkProcessTime(String methodName, ZkServiceInfo configInfo) {
+        //方法级别
+        Long methodProcessTime = null;
+        //服务配置
+        Long serviceProcessTime = null;
 
+        Long globalProcessTime = null;
+
+        if (configInfo != null) {
+            //方法级别
+            methodProcessTime = configInfo.processTimeConfig.serviceConfigs.get(methodName);
+            //服务配置
+            serviceProcessTime = configInfo.processTimeConfig.serviceConfigs.get(ConfigKey.ProcessTime.getValue());
+            globalProcessTime = configInfo.processTimeConfig.globalConfig;
+        }
+
+        if (methodProcessTime != null) {
+            return Optional.of(methodProcessTime);
+        } else if (serviceProcessTime != null) {
+            return Optional.of(serviceProcessTime);
+        } else if (globalProcessTime != null) {
+            return Optional.of(globalProcessTime);
+        } else {
+            return Optional.empty();
+        }
     }
 }
